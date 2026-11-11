@@ -449,34 +449,58 @@ static std::string currentWorkerPeer() {
     return g_worker_peer;
 }
 
-/// Tries to listen on the worker's port the same way ggml's server will, and
-/// returns why it can't ("" if it can). ggml's start_server returns void and
-/// logs nothing on a bind/listen failure, so without this every failure,
-/// whatever its cause, was reported as "the port may already be in use".
-static std::string probeListen(const std::string& endpoint) {
-    const size_t colon = endpoint.rfind(':');
-    const int port = colon == std::string::npos ? 0 : atoi(endpoint.c_str() + colon + 1);
+/// One bind+listen attempt on a throwaway socket. Returns "ok" or why not.
+static std::string tryBind(uint32_t addr_host_order, int port) {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
-        return std::string("socket() failed: ") + strerror(errno) +
-               " (errno " + std::to_string(errno) + ")";
+        const int e = errno;
+        return std::string("socket() ") + strerror(e) + " (errno " + std::to_string(e) + ")";
     }
-    std::string why;
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr.s_addr = htonl(addr_host_order);
     addr.sin_port = htons((uint16_t)port);
+    std::string result = "ok";
     if (bind(fd, (const sockaddr*)&addr, sizeof(addr)) < 0) {
-        why = "bind(" + std::to_string(port) + ") failed: " + strerror(errno) +
-              " (errno " + std::to_string(errno) + ")";
+        const int e = errno;
+        result = std::string(strerror(e)) + " (errno " + std::to_string(e) + ")";
     } else if (listen(fd, 1) < 0) {
-        why = std::string("listen() failed: ") + strerror(errno) +
-              " (errno " + std::to_string(errno) + ")";
+        const int e = errno;
+        result = std::string("listen() ") + strerror(e) + " (errno " + std::to_string(e) + ")";
     }
     close(fd);
-    return why;
+    return result;
+}
+
+/// This process's SELinux domain, e.g. "u:r:untrusted_app:s0:c1,c2".
+static std::string selinuxContext() {
+    std::ifstream f("/proc/self/attr/current");
+    std::string line;
+    if (!f || !std::getline(f, line)) return "unreadable";
+    line.erase(std::remove(line.begin(), line.end(), '\0'), line.end());
+    return line;
+}
+
+/// Tries to listen on the worker's port the same way ggml's server will, and
+/// returns why it can't ("" if it can). ggml's start_server returns void and
+/// logs nothing on a bind/listen failure, so without this every failure,
+/// whatever its cause, was reported as "the port may already be in use".
+/// When the real port fails it also tries other ports and addresses, so the
+/// message shows whether the block is specific to that port, that address, or
+/// to any server socket this app opens.
+static std::string probeListen(const std::string& endpoint) {
+    const size_t colon = endpoint.rfind(':');
+    const int port = colon == std::string::npos ? 0 : atoi(endpoint.c_str() + colon + 1);
+    const std::string main_result = tryBind(INADDR_ANY, port);
+    if (main_result == "ok") return "";
+    return "bind(" + std::to_string(port) + ") failed: " + main_result +
+           " | other tries: any:0 -> " + tryBind(INADDR_ANY, 0) +
+           "; any:" + std::to_string(port + 1) + " -> " + tryBind(INADDR_ANY, port + 1) +
+           "; lo:" + std::to_string(port) + " -> " + tryBind(INADDR_LOOPBACK, port) +
+           "; lo:0 -> " + tryBind(INADDR_LOOPBACK, 0) +
+           " | selinux: " + selinuxContext();
 }
 
 /// Runs this phone as a cluster worker. Blocks for as long as the server
