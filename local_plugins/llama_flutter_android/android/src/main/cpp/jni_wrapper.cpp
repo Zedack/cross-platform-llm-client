@@ -10,6 +10,7 @@
 #include <ctime>
 #include <thread>
 #include <cstring>
+#include <cerrno>
 #include <fstream>
 #include <mutex>
 #include <android/log.h>
@@ -448,6 +449,36 @@ static std::string currentWorkerPeer() {
     return g_worker_peer;
 }
 
+/// Tries to listen on the worker's port the same way ggml's server will, and
+/// returns why it can't ("" if it can). ggml's start_server returns void and
+/// logs nothing on a bind/listen failure, so without this every failure,
+/// whatever its cause, was reported as "the port may already be in use".
+static std::string probeListen(const std::string& endpoint) {
+    const size_t colon = endpoint.rfind(':');
+    const int port = colon == std::string::npos ? 0 : atoi(endpoint.c_str() + colon + 1);
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return std::string("socket() failed: ") + strerror(errno) +
+               " (errno " + std::to_string(errno) + ")";
+    }
+    std::string why;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)port);
+    if (bind(fd, (const sockaddr*)&addr, sizeof(addr)) < 0) {
+        why = "bind(" + std::to_string(port) + ") failed: " + strerror(errno) +
+              " (errno " + std::to_string(errno) + ")";
+    } else if (listen(fd, 1) < 0) {
+        why = std::string("listen() failed: ") + strerror(errno) +
+              " (errno " + std::to_string(errno) + ")";
+    }
+    close(fd);
+    return why;
+}
+
 /// Runs this phone as a cluster worker. Blocks for as long as the server
 /// runs (ggml has no way to stop it), so it lives in its own process; only
 /// returns, with the reason, if the server couldn't start.
@@ -474,13 +505,21 @@ Java_com_write4me_llama_1flutter_1android_ClusterNative_nativeServe(
 
     const std::string ep = jstringToStd(env, endpoint);
     const std::string cache = jstringToStd(env, cache_dir);
+    const std::string probe = probeListen(ep);
+    if (!probe.empty()) {
+        LOGE("Cluster worker can't listen on %s: %s", ep.c_str(), probe.c_str());
+        return env->NewStringUTF(("Worker can't listen on " + ep + ": " + probe).c_str());
+    }
     LOGI("Cluster worker listening on %s (cache %s)", ep.c_str(), cache.c_str());
     g_worker_running = true;
     std::thread([] { runRadioKeepAwake(g_worker_running, currentWorkerPeer); }).detach();
     start(ep.c_str(), cache.empty() ? nullptr : cache.c_str(),
           (size_t)std::max<jlong>(1, n_threads), 1, &cpu);
     g_worker_running = false;
-    return env->NewStringUTF("Worker stopped: the port may already be in use");
+    // The port was free a moment ago (probeListen), so this is not a port
+    // clash: the server failed to start its backend, or stopped on a client
+    // error. ggml logs the reason to logcat (process ":cluster").
+    return env->NewStringUTF("Worker server exited unexpectedly (see logcat for details)");
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
